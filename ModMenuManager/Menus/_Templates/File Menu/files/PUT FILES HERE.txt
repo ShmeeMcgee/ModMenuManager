@@ -1,0 +1,2 @@
+Everything in this "files" folder is copied into the game folder, keeping the
+same layout. Delete this text file when you add the menu's real files.
