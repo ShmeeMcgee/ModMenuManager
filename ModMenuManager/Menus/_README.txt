@@ -21,4 +21,9 @@ PLUGIN MENUS  (type = plugin)
     Menus\ALL\My Plugin Menu\menu.ini
     Menus\ALL\My Plugin Menu\MyMenu.xex
 
+DOWNLOADS
+  Download menus (in the script) saves menus from the online library straight
+  into these folders. Offline? Copy menu zips, codxe.xex or Hayzen.xex into
+  _Inbox and choose Download menus > Import from Menus\_Inbox.
+
 Folders that start with _ are ignored. Copy one from _Templates to start.

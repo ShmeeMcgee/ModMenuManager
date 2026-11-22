@@ -4,7 +4,7 @@
    Call of Duty mod menus for the Xbox 360, managed from the controller
 
    ----------------------------------------------------------------------------
-   Version   0.1 (preview)
+   Version   0.2 (preview)
    Type      Aurora utility script
    License   MIT (see LICENSE)
    GitHub    https://github.com/ShmeeMcgee
@@ -23,6 +23,10 @@
        back with one press.
      - Boots the game straight from the script through Xbdm, the same way
        Dev Map Launcher does.
+     - Downloads menus from the online Shmees library: Shmees Menus for
+       CoD4, World at War, MW2 and Black Ops (with Zombies menus for WaW and
+       Black Ops), plus well-known open-source menus with their authors'
+       credit and licence.
 
    Every change is written to manager.log beside this script.
 
@@ -30,8 +34,8 @@
 
 scriptTitle       = "Mod Menu Manager"
 scriptAuthor      = "Shmees"
-scriptVersion     = 0.1
-scriptDescription = "Install and remove Call of Duty mod menus from the controller. Every file it replaces is backed up and can be restored in one press."
+scriptVersion     = 0.2
+scriptDescription = "Download, install and remove Call of Duty mod menus from the controller. Every file it replaces is backed up and can be restored in one press."
 scriptIcon        = "icon.png"
 scriptPermissions = { "http", "filesystem" }
 
@@ -57,6 +61,13 @@ local DashLaunchDevices = { Hdd1 = "Hdd:", Usb0 = "Usb:", Usb1 = "Usb:", Usb2 = 
 -- Number of DashLaunch plugin slots (plugin1 ... plugin5).
 local PluginSlots = 5
 
+-- The online menu library. The first address that answers is used.
+-- To use your own mirror, put "library = http://..." in settings.ini beside
+-- this script; it is tried first.
+local LibraryUrls = {
+  "https://raw.githubusercontent.com/ShmeeMcgee/ModMenuManager/main/library/catalog.ini",
+}
+
 
 --==============================================================================
 -- GAME CATALOG
@@ -81,7 +92,7 @@ local ALL_GAMES = { key = "ALL", name = "All games" }
 -- Drives that never hold games.
 local SKIP_MOUNTS = { game = true, aurora = true, flash = true, sysext = true, sysaux = true }
 
-local VERSION_TEXT = "0.1 (preview)"
+local VERSION_TEXT = "0.2 (preview)"
 local LOG_LIMIT    = 20000
 local RECORD_KEYS  = { "id", "kind", "status", "game", "menu", "version", "package", "when",
                        "folder", "ini", "slot", "previous", "value", "plugin" }
@@ -277,6 +288,8 @@ local STATE     = join(BASE, "installed.txt")
 local FOLDERS   = join(BASE, "folders.txt")
 local SETTINGS  = join(BASE, "settings.ini")
 local LOGFILE   = join(BASE, "manager.log")
+local DOWNLOADS = join(BASE, "Downloads")
+local INBOX     = join(MENUS, "_Inbox")
 
 local function num(t, ...)
   if type(t) ~= "table" then return nil end
@@ -315,6 +328,23 @@ local function parseIni(text)
     end
   end
   return t
+end
+
+-- INI with [sections], in file order: { { section = "name", key = value, ... }, ... }
+local function parseIniSections(text)
+  local out, cur = {}, nil
+  for line in tostring(text or ""):gmatch("[^\r\n]+") do
+    local l = trim(line)
+    local sec = l:match("^%[(.-)%]$")
+    if sec then
+      cur = { section = trim(sec) }
+      out[#out + 1] = cur
+    elseif cur and l ~= "" and not l:match("^[;#]") then
+      local k, v = l:match("^([%w_%.%-]+)%s*=%s*(.-)$")
+      if k then cur[k:lower()] = trim((v:gsub("%s+;.*$", ""))) end
+    end
+  end
+  return out
 end
 
 local function getSetting(key)
@@ -603,6 +633,10 @@ local function loadPackages(gameKey)
           note        = ini.note or "",
           launch      = ini.launch or "",
           plugin      = ini.plugin or "",
+          requires    = (ini.requires or ""):lower(),
+          tu          = ini.tu or "",
+          license     = ini.license or "",
+          homepage    = ini.homepage or "",
         }
         if pkg.kind == "plugin" and pkg.plugin == "" then
           for _, f in ipairs(listFiles(pdir)) do
@@ -638,6 +672,12 @@ local function packageDetails(pkg, game)
   lines[#lines + 1] = "Game:  " .. (pkg.scope == "ALL" and "All supported games" or game.name)
   lines[#lines + 1] = "Type:  " .. (pkg.kind == "plugin" and ("Plugin menu (" .. pkg.plugin .. ")") or "Game files")
   if pkg.mode ~= "" then lines[#lines + 1] = "Mode:  " .. pkg.mode end
+  local needs = {}
+  if pkg.requires:find("codxe", 1, true) then needs[#needs + 1] = "CoD Xe plugin" end
+  if pkg.tu ~= "" then needs[#needs + 1] = "title update " .. pkg.tu end
+  if #needs > 0 then lines[#lines + 1] = "Needs: " .. table.concat(needs, ", ") end
+  if pkg.license ~= "" then lines[#lines + 1] = "Licence: " .. pkg.license end
+  if pkg.homepage ~= "" then lines[#lines + 1] = "Home: " .. pkg.homepage end
   if pkg.note ~= "" then
     lines[#lines + 1] = ""
     lines[#lines + 1] = "Note:  " .. pkg.note
@@ -716,6 +756,9 @@ end
 -- FILE MENUS
 --==============================================================================
 
+-- Defined further down: checks for the CoD Xe plugin and offers to set it up.
+local ensureCodxe
+
 local function restoreFiles(rec)
   local backupDir = join(BACKUPS, rec.id)
   local failed = {}
@@ -789,6 +832,8 @@ local function installFiles(pkg, inst)
       "laid out exactly as they go in the game folder.")
     return false
   end
+
+  if pkg.requires:find("codxe", 1, true) and ensureCodxe(pkg, inst.game) == "cancel" then return false end
 
   local recs = loadRecords()
   local current = findRecord(recs, function(r) return r.kind == "files" and r.folder and r.folder:lower() == inst.path:lower() end)
@@ -1129,6 +1174,344 @@ end
 
 
 --==============================================================================
+-- DOWNLOADS (online library and Menus\_Inbox)
+--==============================================================================
+
+-- Plugins that can be dropped into Menus\_Inbox as a bare .xex.
+local KNOWN_PLUGINS = {
+  ["codxe.xex"] = {
+    name = "CoD Xe", author = "michaeloliverx", license = "MIT", homepage = "github.com/michaeloliverx/codxe",
+    description = "Open-source modding plugin for older Call of Duty games. Loads plain GSC scripts such as the Shmees Menu.",
+    note = "Needs CoD4 TU4, World at War TU7, MW2 TU9 or Black Ops TU11.",
+  },
+  ["hayzen.xex"] = {
+    name = "Hayzen", author = "ClementDreptin", license = "Apache-2.0", homepage = "github.com/ClementDreptin/Hayzen",
+    description = "Open-source mod menu plugin for CoD4, World at War, MW2, MW3, the Ghosts alpha and NX1.",
+    note = "Needs CoD4 TU4, World at War TU7, MW2 TU9 or MW3 TU24.",
+  },
+}
+
+local function under(path, root)
+  local p, r = trimSlash(path):lower(), trimSlash(root):lower()
+  return p:sub(1, #r + 1) == r .. "\\"
+end
+
+-- Deletes a folder tree. Only ever used inside the script's own folders.
+local function deleteTree(dir)
+  if not (under(dir, MENUS) or under(dir, DOWNLOADS)) then return false end
+  for _, rel in ipairs(walk(dir)) do deleteFile(join(dir, rel)) end
+  for _, d in ipairs(listDirs(dir)) do pruneEmpty(join(dir, d)) end
+  pruneEmpty(dir)
+  return not dirExists(dir)
+end
+
+local function copyTree(src, dst)
+  local rels = walk(src)
+  for i, rel in ipairs(rels) do
+    progress("Copying " .. rel, i - 1, #rels)
+    if not copyFile(join(src, rel), join(dst, rel)) then return false, rel end
+  end
+  return true
+end
+
+-- Script-relative path, as Http.Get and ZipFile expect.
+local function relative(path)
+  local base = BASE:lower() .. "\\"
+  if path:lower():sub(1, #base) == base then return path:sub(#base + 1) end
+  return path
+end
+
+local function gameLabel(key)
+  local g = gameByKey(key)
+  return g and g.name or key
+end
+
+local function parseCatalog(text)
+  local cat = { info = {}, items = {} }
+  for _, sec in ipairs(parseIniSections(text)) do
+    if sec.section:lower() == "library" then
+      cat.info = sec
+    else
+      local item = {
+        id = sec.section, name = sec.name or sec.section, game = (sec.game or ""):upper(),
+        version = sec.version or "", author = sec.author or "", kind = (sec.type or "files"):lower(),
+        format = (sec.format or "zip"):lower(), url = sec.url or "", file = sec.file or "",
+        folder = sec.folder or sec.name or sec.section, size = sec.size or "",
+        description = sec.description or "", note = sec.note or "", requires = sec.requires or "",
+        tu = sec.tu or "", license = sec.license or "", homepage = sec.homepage or "",
+        mode = sec.mode or "", launch = sec.launch or "",
+      }
+      item.folder = item.folder:gsub("[\\/:%*%?\"<>|]", "")
+      if item.url ~= "" and (item.game == "ALL" or gameByKey(item.game)) then
+        cat.items[#cat.items + 1] = item
+      end
+    end
+  end
+  return cat
+end
+
+local function fetchCatalog()
+  local urls = {}
+  local custom = getSetting("library")
+  if custom and custom ~= "" then urls[#urls + 1] = custom end
+  for _, u in ipairs(LibraryUrls) do urls[#urls + 1] = u end
+  for i, url in ipairs(urls) do
+    progress("Loading the menu library...", i - 1, #urls)
+    local http = safe(function() return Http.Get(url) end)
+    if http and http.Success and type(http.OutputData) == "string" then
+      local cat = parseCatalog(http.OutputData)
+      if #cat.items > 0 then
+        log("Library loaded from " .. url .. " (" .. plural(#cat.items, "item") .. ")")
+        return cat, url
+      end
+    end
+    log("Library not reachable: " .. url)
+  end
+  return nil
+end
+
+local function extractZip(zipPath, destDir)
+  deleteTree(destDir)
+  mkdirs(destDir)
+  local ok = safe(function()
+    local z = ZipFile.OpenFile(relative(zipPath))
+    if not z then return false end
+    return z:Extract(relative(destDir) .. "\\")
+  end)
+  return ok ~= nil and ok ~= false and #walk(destDir) > 0
+end
+
+-- The folder in an extracted zip that holds menu.ini (the root, or one folder down).
+local function packageRoot(dir)
+  if exists(join(dir, "menu.ini")) then return dir end
+  for _, d in ipairs(listDirs(dir)) do
+    if exists(join(join(dir, d), "menu.ini")) then return join(dir, d) end
+  end
+  return nil
+end
+
+local function iniLine(k, v)
+  if v == nil or v == "" then return nil end
+  return string.format("%-11s = %s", k, v)
+end
+
+local function writePluginIni(dir, item)
+  local lines = { "; Written by Mod Menu Manager from the menu library" }
+  for _, kv in ipairs({
+    { "name", item.name }, { "version", item.version }, { "author", item.author }, { "type", "plugin" },
+    { "plugin", item.file }, { "description", item.description }, { "note", item.note },
+    { "license", item.license }, { "homepage", item.homepage },
+  }) do
+    local l = iniLine(kv[1], kv[2])
+    if l then lines[#lines + 1] = l end
+  end
+  return writeText(join(dir, "menu.ini"), table.concat(lines, "\r\n") .. "\r\n")
+end
+
+local function isXex(path)
+  local data = readText(path)
+  return data ~= nil and #data > 1024 and data:sub(1, 4) == "XEX2"
+end
+
+-- Downloads one library item into Menus\<GAME>\<folder>. Returns the folder or nil.
+local function downloadItem(item)
+  local dest = join(join(MENUS, item.game), item.folder)
+  if dirExists(dest) then
+    local b = ask(title("Already downloaded"),
+      item.name .. " is already in your library:\n" .. dest ..
+      "\n\nDownload it again and replace that copy? Menus already installed in a game are not touched.",
+      "Download again", "Cancel")
+    if b ~= 1 then return nil end
+  end
+  mkdirs(DOWNLOADS)
+  log("Download '" .. item.name .. "' from " .. item.url)
+
+  if item.format == "xex" then
+    local file = item.file ~= "" and item.file or leafOf(item.url:gsub("/", "\\"))
+    local tmp = join(DOWNLOADS, file)
+    deleteFile(tmp)
+    progress("Downloading " .. file .. "...", 0, 2)
+    local http = safe(function() return Http.Get(item.url, relative(tmp)) end)
+    local got = (http and http.Success and type(http.OutputPath) == "string" and http.OutputPath ~= "") and http.OutputPath or tmp
+    deleteTree(dest)
+    mkdirs(dest)
+    item.file = file
+    writePluginIni(dest, item)
+    if isXex(got) and copyFile(got, join(dest, file)) then
+      deleteFile(got)
+      progress("Done", 2, 2)
+      log("  Saved " .. join(dest, file))
+      return dest
+    end
+    deleteFile(got)
+    log("  Download failed or not an XEX")
+    info(title("Download didn't finish"),
+      file .. " couldn't be downloaded on the console.\n\nDownload it on a PC from:\n" .. item.url ..
+      "\n\nThen copy it into:\n" .. dest .. "\n\nThe menu entry is already set up, so it shows in Install a mod menu as soon as the file is there.")
+    return nil
+  end
+
+  local zip = join(DOWNLOADS, idFor(item.id) .. ".zip")
+  local tmpDir = join(DOWNLOADS, idFor(item.id))
+  deleteFile(zip)
+  progress("Downloading " .. item.name .. "...", 0, 3)
+  local http = safe(function() return Http.Get(item.url, relative(zip)) end)
+  local got = (http and http.Success and type(http.OutputPath) == "string" and http.OutputPath ~= "") and http.OutputPath or zip
+  if not (http and http.Success) or not exists(got) then
+    log("  Download failed")
+    info(title("Download didn't finish"),
+      item.name .. " couldn't be downloaded.\n\nCheck the console is online, or download the zip on a PC from:\n" ..
+      item.url .. "\n\nand copy it into:\n" .. INBOX .. "\n\nthen use Import from Menus\\_Inbox.")
+    return nil
+  end
+  progress("Unpacking " .. item.name .. "...", 1, 3)
+  local root = extractZip(got, tmpDir) and packageRoot(tmpDir) or nil
+  if not root then
+    deleteFile(got)
+    deleteTree(tmpDir)
+    log("  Zip could not be unpacked or has no menu.ini")
+    info(title("Download problem"), "The download for " .. item.name .. " couldn't be unpacked. Try again later.")
+    return nil
+  end
+  progress("Adding to your library...", 2, 3)
+  deleteTree(dest)
+  local ok, bad = copyTree(root, dest)
+  deleteFile(got)
+  deleteTree(tmpDir)
+  if not ok then
+    log("  Copy failed at " .. tostring(bad))
+    info(title("Download problem"), "Couldn't copy " .. tostring(bad) .. " into:\n" .. dest)
+    return nil
+  end
+  progress("Done", 3, 3)
+  log("  Saved " .. dest)
+  return dest
+end
+
+-- Imports every .zip (menu packages) and known .xex plugin from Menus\_Inbox.
+local function importInbox()
+  mkdirs(INBOX)
+  local files = listFiles(INBOX)
+  local done, problems = {}, {}
+  for _, f in ipairs(files) do
+    local src = join(INBOX, f)
+    local lower = f:lower()
+    local dest = nil
+    if lower:match("%.zip$") then
+      local tmpDir = join(DOWNLOADS, "inbox_" .. idFor(f))
+      local root = extractZip(src, tmpDir) and packageRoot(tmpDir) or nil
+      if root then
+        local ini = parseIni(readText(join(root, "menu.ini")))
+        local key = (ini.game or ""):upper()
+        if key ~= "ALL" and not gameByKey(key) then
+          local names = {}
+          for i, g in ipairs(GAMES) do names[i] = g.name end
+          names[#names + 1] = "All games (plugin)"
+          local n = popup(title("Which game is " .. (ini.name or f) .. " for?"), names)
+          key = n and (GAMES[n] and GAMES[n].key or "ALL") or nil
+        end
+        if key then
+          dest = join(join(MENUS, key), ((ini.name and ini.name ~= "") and ini.name or f:gsub("%.zip$", "")):gsub("[\\/:%*%?\"<>|]", ""))
+          deleteTree(dest)
+          if not copyTree(root, dest) then dest = nil end
+        end
+      end
+      deleteTree(tmpDir)
+    elseif KNOWN_PLUGINS[lower] and isXex(src) then
+      local k = KNOWN_PLUGINS[lower]
+      dest = join(join(MENUS, "ALL"), k.name)
+      mkdirs(dest)
+      local item = { name = k.name, author = k.author, file = f, description = k.description, note = k.note,
+                     license = k.license, homepage = k.homepage, version = "" }
+      if not (copyFile(src, join(dest, f)) and writePluginIni(dest, item)) then dest = nil end
+    end
+    if dest then
+      local imported = join(INBOX, "Imported")
+      mkdirs(imported)
+      if copyFile(src, join(imported, f)) then deleteFile(src) end
+      done[#done + 1] = f
+      log("Imported " .. f .. " -> " .. dest)
+    elseif lower:match("%.zip$") or lower:match("%.xex$") then
+      problems[#problems + 1] = f
+    end
+  end
+  return done, problems
+end
+
+local function findPluginPackage(fileName)
+  for _, pkg in ipairs(loadPackages("ALL")) do
+    if pkg.scope == "ALL" and pkg.kind == "plugin" and pkg.plugin:lower() == fileName:lower() and exists(join(pkg.dir, pkg.plugin)) then
+      return pkg
+    end
+  end
+  return nil
+end
+
+local function pluginLoaded(word)
+  for _, ini in ipairs(findLaunchInis()) do
+    for _, v in pairs(readSlots(ini.text)) do
+      if tostring(v):lower():find(word, 1, true) then return true end
+    end
+  end
+  return false
+end
+
+ensureCodxe = function(pkg, game)
+  if pluginLoaded("codxe") then return "loaded" end
+  local b = ask(title("CoD Xe needed"),
+    pkg.name .. " runs through CoD Xe, a free open-source plugin that loads GSC scripts. " ..
+    "It isn't in launch.ini yet.\n\n" ..
+    (pkg.tu ~= "" and ("This game also needs title update " .. pkg.tu .. " installed.\n\n") or "") ..
+    "Set up CoD Xe first?", "Set up CoD Xe", "Install anyway", "Cancel")
+  if b == 2 then return "skip" end
+  if b ~= 1 then return "cancel" end
+  local codxe = findPluginPackage("codxe.xex")
+  if not codxe then
+    local cat = fetchCatalog()
+    local item = nil
+    for _, it in ipairs(cat and cat.items or {}) do
+      if it.file:lower() == "codxe.xex" then item = it break end
+    end
+    if not item then
+      info(title("CoD Xe"), "The menu library couldn't be reached.\n\nPut codxe.xex (from github.com/michaeloliverx/codxe) in:\n" ..
+        INBOX .. "\n\nthen use Download menus > Import from Menus\\_Inbox.")
+      return "cancel"
+    end
+    if not downloadItem(item) then return "cancel" end
+    codxe = findPluginPackage("codxe.xex")
+    if not codxe then return "cancel" end
+  end
+  if installPlugin(codxe, game) then return "ok" end
+  return "cancel"
+end
+
+local function itemDetails(item)
+  local lines = { item.name .. (item.version ~= "" and ("  v" .. item.version) or "") }
+  if item.author ~= "" then lines[#lines + 1] = "By " .. item.author end
+  lines[#lines + 1] = ""
+  if item.description ~= "" then
+    lines[#lines + 1] = item.description
+    lines[#lines + 1] = ""
+  end
+  lines[#lines + 1] = "Game:  " .. (item.game == "ALL" and "All supported games" or gameLabel(item.game))
+  lines[#lines + 1] = "Type:  " .. (item.kind == "plugin" and "Plugin menu" or "Game files")
+  if item.mode ~= "" then lines[#lines + 1] = "Mode:  " .. item.mode end
+  if item.size ~= "" then lines[#lines + 1] = "Size:  " .. item.size end
+  local needs = {}
+  if item.requires:lower():find("codxe", 1, true) then needs[#needs + 1] = "CoD Xe plugin" end
+  if item.tu ~= "" then needs[#needs + 1] = "title update " .. item.tu end
+  if #needs > 0 then lines[#lines + 1] = "Needs: " .. table.concat(needs, ", ") end
+  if item.license ~= "" then lines[#lines + 1] = "Licence: " .. item.license end
+  if item.homepage ~= "" then lines[#lines + 1] = "Home: " .. item.homepage end
+  if item.note ~= "" then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "Note: " .. item.note
+  end
+  return table.concat(lines, "\n")
+end
+
+
+--==============================================================================
 -- SCREENS
 --==============================================================================
 
@@ -1241,6 +1624,98 @@ local function screenInstall()
           local inst, action = chooseInstall(game)
           if action == "browse" then inst = addFolderFor(game) end
           if inst then installFiles(pkg, inst) end
+        end
+      end
+    end
+  end
+end
+
+local function offerInstall(dir, gameKey)
+  local pkg = nil
+  for _, p in ipairs(loadPackages(gameKey)) do
+    if p.dir:lower() == dir:lower() then pkg = p break end
+  end
+  if not pkg then return end
+  if ask(title("Downloaded"), pkg.name .. " is in your library now.\n\nInstall it now?", "Install now", "Later") ~= 1 then
+    return
+  end
+  if pkg.kind == "plugin" then
+    installPlugin(pkg, gameByKey(gameKey))
+  else
+    local game = gameByKey(gameKey)
+    local inst, action = chooseInstall(game)
+    if action == "browse" then inst = addFolderFor(game) end
+    if inst then installFiles(pkg, inst) end
+  end
+end
+
+local function screenDownload()
+  local cat, url = fetchCatalog()
+  while true do
+    local labels, actions = {}, {}
+    labels[#labels + 1] = "[ Import from Menus\\_Inbox ]"
+    actions[#actions + 1] = "inbox"
+    if cat then
+      local counts, order = {}, {}
+      for _, it in ipairs(cat.items) do
+        if not counts[it.game] then counts[it.game] = 0 order[#order + 1] = it.game end
+        counts[it.game] = counts[it.game] + 1
+      end
+      local rank = { ALL = 0 }
+      for i, g in ipairs(GAMES) do rank[g.key] = i end
+      table.sort(order, function(a, b) return (rank[a] or 99) < (rank[b] or 99) end)
+      for _, key in ipairs(order) do
+        labels[#labels + 1] = (key == "ALL" and "All games (plugins)" or gameLabel(key)) .. "    " .. plural(counts[key], "menu")
+        actions[#actions + 1] = key
+      end
+    else
+      labels[#labels + 1] = "[ Try the library again ]"
+      actions[#actions + 1] = "retry"
+    end
+    local head = cat and ((cat.info.name or "Menu library") .. (cat.info.updated and ("  (updated " .. cat.info.updated .. ")") or ""))
+      or "Library offline"
+    local n = popup(title("Download menus - " .. head), labels)
+    if not n then return end
+    local a = actions[n]
+
+    if a == "inbox" then
+      local done, problems = importInbox()
+      if #done == 0 and #problems == 0 then
+        info(title("Inbox empty"),
+          "Nothing to import.\n\nCopy menu zips, codxe.xex or Hayzen.xex into:\n" .. INBOX .. "\n\nthen choose Import again.")
+      else
+        info(title("Imported"),
+          (#done > 0 and (plural(#done, "file") .. " imported:\n" .. table.concat(done, "\n")) or "Nothing was imported.") ..
+          (#problems > 0 and ("\n\nCouldn't import:\n" .. table.concat(problems, "\n") .. "\n\nZips need a menu.ini inside.") or ""))
+      end
+    elseif a == "retry" then
+      cat, url = fetchCatalog()
+      if not cat then
+        info(title("Library offline"),
+          "The menu library couldn't be reached.\n\nCheck the console is online. You can still copy menu zips into:\n" ..
+          INBOX .. "\n\nand import them from here.")
+      end
+    else
+      while true do
+        local items = {}
+        for _, it in ipairs(cat.items) do
+          if it.game == a then items[#items + 1] = it end
+        end
+        local names = {}
+        for i, it in ipairs(items) do
+          local have = dirExists(join(join(MENUS, it.game), it.folder))
+          names[i] = it.name .. (it.version ~= "" and ("  v" .. it.version) or "") ..
+            (it.author ~= "" and ("  by " .. it.author) or "") .. (have and "   [in library]" or "")
+        end
+        local i = popup(title((a == "ALL" and "All games" or gameLabel(a)) .. " - library"), names, "Nothing here yet.")
+        if not i then break end
+        local item = items[i]
+        if ask(title(item.name), itemDetails(item), "Download", "Back") == 1 then
+          local dir = downloadItem(item)
+          if dir then
+            notify(item.name .. " downloaded")
+            offerInstall(dir, item.game)
+          end
         end
       end
     end
@@ -1371,6 +1846,18 @@ local HELP = {
     "GAME is one of: BO3 BO2 BO1 MW3 MW2 GHOSTS AW WAW COD4, or ALL for plugins that work in every game.\n\n" ..
     "File menus keep their files in a 'files' folder, laid out exactly as they go in the game folder. " ..
     "Plugin menus keep their .xex next to menu.ini.\n\nSee Menus\\_Templates for examples." },
+  { "Downloading menus",
+    "Download menus reads the online Shmees library and saves menus straight into your library, ready to install.\n\n" ..
+    "Offline? Download the zip (or .xex) on a PC, copy it into Menus\\_Inbox beside this script, then choose " ..
+    "Import from Menus\\_Inbox." },
+  { "Shmees Menu controls",
+    "Open: Aim + Knife\nScroll: Aim (up) / Shoot (down)\nSelect: Use (X)\nBack / close: Knife\n\n" ..
+    "The host gets the menu. Give it to others from Players, or turn on Menu for Everyone.\n\n" ..
+    "World at War and Black Ops also get a Zombies menu with points, perks, Pack-a-Punch, rounds and doors." },
+  { "CoD Xe",
+    "Shmees Menus run through CoD Xe, a free open-source plugin by michaeloliverx that loads plain GSC scripts.\n\n" ..
+    "It needs these title updates: CoD4 TU4, World at War TU7, MW2 TU9, Black Ops TU11.\n\n" ..
+    "Installing a Shmees Menu offers to set CoD Xe up for you." },
   { "File menus vs plugin menus",
     "File menus (patch .ff files, GSC scripts) are copied into an extracted game folder. " ..
     "They don't work with Games on Demand installs.\n\n" ..
@@ -1396,7 +1883,9 @@ end
 local function screenAbout()
   info(title("About"),
     "Mod Menu Manager  v" .. VERSION_TEXT .. "\nby Shmees\n\n" ..
-    "Install and remove Call of Duty mod menus from the controller, with a backup of every change.\n\n" ..
+    "Download, install and remove Call of Duty mod menus from the controller, with a backup of every change.\n\n" ..
+    "Library menus belong to their authors and keep their own licences. CoD Xe by michaeloliverx, " ..
+    "Hayzen by ClementDreptin.\n\n" ..
     "Released under the MIT License.\ngithub.com/ShmeeMcgee  |  youtube.com/@Shmees14")
 end
 
@@ -1420,6 +1909,7 @@ end
 function main()
   log("Opened Mod Menu Manager v" .. VERSION_TEXT .. " from " .. BASE)
   mkdirs(BACKUPS)
+  mkdirs(INBOX)
   for _, g in ipairs(GAMES) do
     if not dirExists(join(MENUS, g.key)) then mkdirs(join(MENUS, g.key)) end
   end
@@ -1440,6 +1930,7 @@ function main()
     local recs = loadRecords()
     local items = {
       "Install a mod menu",
+      "Download menus",
       "Installed menus  (" .. #recs .. ")",
       "Game library  (" .. plural(#games, "game") .. ")",
       "Launch a game",
@@ -1449,11 +1940,12 @@ function main()
     local n = popup("Mod Menu Manager  v" .. VERSION_TEXT .. "  |  by Shmees", items)
     if not n then break end
     if n == 1 then screenInstall()
-    elseif n == 2 then screenInstalled()
-    elseif n == 3 then screenLibrary()
-    elseif n == 4 then screenLaunch()
-    elseif n == 5 then screenHelp()
-    elseif n == 6 then screenAbout()
+    elseif n == 2 then screenDownload()
+    elseif n == 3 then screenInstalled()
+    elseif n == 4 then screenLibrary()
+    elseif n == 5 then screenLaunch()
+    elseif n == 6 then screenHelp()
+    elseif n == 7 then screenAbout()
     end
   end
   log("Closed")

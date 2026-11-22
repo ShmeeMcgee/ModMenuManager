@@ -135,7 +135,31 @@ function M.install(root)
     GetTime = function() return { Hour = 2, Minute = 14, Second = 0 } end,
     GetIPAddress = function() return "192.168.1.50" end,
   }
-  Http = { Get = function(url) M.http[#M.http + 1] = url; return { Success = true, OutputData = "200- OK" } end }
+  -- M.web[url] = { file = "/real/path" } or { text = "..." }. Anything else fails, like an offline console.
+  Http = { Get = function(url, rel)
+    M.http[#M.http + 1] = url
+    if url:find(":730/", 1, true) then return { Success = true, OutputData = "200- OK" } end
+    local w = M.web and M.web[url]
+    if not w then return { Success = false } end
+    local data = w.text or readAll(w.file)
+    if rel then
+      local dst = real(M.base .. rel)
+      local f = io.open(dst, "wb"); if not f then return { Success = false } end
+      f:write(data); f:close()
+      return { Success = true, OutputPath = M.base .. rel }
+    end
+    return { Success = true, OutputData = data }
+  end }
+  ZipFile = { OpenFile = function(rel)
+    local zp = real(M.base .. rel)
+    if not isfile(zp) then return nil end
+    return { Extract = function(self, destRel)
+      local d = real(M.base .. destRel)
+      os.execute("mkdir -p '" .. d .. "'")
+      local r = os.execute("unzip -o -q '" .. zp .. "' -d '" .. d .. "'")
+      return r == true or r == 0
+    end }
+  end }
   Thread = { Sleep = function() end }
 end
 

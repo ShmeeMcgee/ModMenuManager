@@ -182,5 +182,81 @@ check("unfinished install warning shown", seen("Unfinished install"))
 run("Help and about", { "OK", "Help", "Adding menus", "OK", "<back>", "About", "OK" })
 check("help and about shown", seen("Menus\\<GAME>\\<Menu name>") and seen("Released under the MIT License"))
 
+-- 12+. Downloads from the online library (built by library/build_library.py)
+local LIB = arg[3] or (here .. "/../library")
+local RAWBASE = "https://raw.githubusercontent.com/ShmeeMcgee/ModMenuManager/main/library/"
+local FAKE_XEX = "XEX2" .. string.rep("\0", 4096)
+local function webLibrary()
+  A.web = {
+    [RAWBASE .. "catalog.ini"] = { file = LIB .. "/catalog.ini" },
+    [RAWBASE .. "packages/shmees-menu-mw2.zip"] = { file = LIB .. "/packages/shmees-menu-mw2.zip" },
+    [RAWBASE .. "packages/shmees-menu-cod4.zip"] = { file = LIB .. "/packages/shmees-menu-cod4.zip" },
+    [RAWBASE .. "packages/codxe.xex"] = { text = FAKE_XEX },
+    [RAWBASE .. "packages/codjumper-mw2.zip"] = { file = LIB .. "/packages/codjumper-mw2.zip" },
+  }
+end
+
+fixture(); A.install(ROOT); webLibrary()
+run("Download Shmees Menu for MW2, set up CoD Xe, install", {
+  "I understand", "Download menus", "Modern Warfare 2", "Shmees Menu", "Download", "Install now",
+  "Set up CoD Xe", "plugin3", "Install", "OK", "Install", "Done",
+})
+check("library title shown", seen("Shmees Menu Library  (updated 2026-11-22)"))
+check("Shmees Menu package saved to library", exists(SCRIPT .. "/Menus/MW2/Shmees Menu/menu.ini") and
+  exists(SCRIPT .. "/Menus/MW2/Shmees Menu/files/_codxe/mods/shmees/maps/mp/gametypes/_shmees.gsc"))
+check("CoD Xe prompt shown with title update", seen("CoD Xe needed") and seen("title update TU9"))
+check("CoD Xe plugin downloaded with menu.ini", read(SCRIPT .. "/Menus/ALL/CoD Xe/codxe.xex") == FAKE_XEX and
+  (read(SCRIPT .. "/Menus/ALL/CoD Xe/menu.ini") or ""):find("plugin      = codxe.xex", 1, true))
+local ini3 = read(ROOT .. "/Usb0/launch.ini")
+check("CoD Xe loaded in plugin3", ini3:find("plugin3 = Usb:\\Plugins\\ModMenus\\codxe.xex", 1, true), ini3)
+check("codxe.json put in the game folder", (read(MW2 .. "/_codxe/codxe.json") or ""):find('"active_mod": "shmees"', 1, true))
+check("MW2 hook and menu scripts installed", exists(MW2 .. "/_codxe/mods/shmees/maps/mp/gametypes/_deathicons.gsc") and
+  exists(MW2 .. "/_codxe/mods/shmees/maps/mp/gametypes/_shmees.gsc"))
+local recs2 = read(SCRIPT .. "/installed.txt") or ""
+check("both installs recorded", select(2, recs2:gsub("%[record%]", "")) == 2 and recs2:find("menu=CoD Xe", 1, true) and
+  recs2:find("menu=Shmees Menu", 1, true), recs2)
+check("downloads folder cleaned up", #(function() local t = {} for e in lfs.dir(SCRIPT .. "/Downloads") do
+  if e ~= "." and e ~= ".." then t[#t + 1] = e end end return t end)() == 0)
+
+run("No CoD Xe prompt once it's loaded", {
+  "Install a mod menu", "Modern Warfare 2", "Shmees Menu", "Install", "Cancel",
+})
+check("CoD Xe not asked for again", not seen("CoD Xe needed") and seen("Replace menu?"))
+
+run("Plugin download that fails explains the PC route", {
+  "Download menus", "All games", "Hayzen", "Download", "OK",
+})
+check("failed download explained", seen("Download didn't finish") and seen("library/packages/Hayzen.xex"))
+check("Hayzen entry prepared for a manual copy", exists(SCRIPT .. "/Menus/ALL/Hayzen/menu.ini") and
+  not exists(SCRIPT .. "/Menus/ALL/Hayzen/Hayzen.xex"))
+
+mkfile(SCRIPT .. "/Menus/_Inbox/Hayzen.xex", FAKE_XEX)
+sh("cp '" .. LIB .. "/packages/shmees-menu-cod4.zip' '" .. SCRIPT .. "/Menus/_Inbox/'")
+run("Import a zip and a plugin from Menus\\_Inbox", {
+  "Download menus", "Import from Menus", "OK",
+})
+check("zip imported into its game", exists(SCRIPT .. "/Menus/COD4/Shmees Menu/menu.ini") and
+  exists(SCRIPT .. "/Menus/COD4/Shmees Menu/files/_codxe/mods/shmees/maps/mp/gametypes/_clientids.gsc"))
+check("known plugin imported", read(SCRIPT .. "/Menus/ALL/Hayzen/Hayzen.xex") == FAKE_XEX)
+check("inbox files moved to Imported", exists(SCRIPT .. "/Menus/_Inbox/Imported/shmees-menu-cod4.zip") and
+  not exists(SCRIPT .. "/Menus/_Inbox/Hayzen.xex"))
+
+run("Remove the Shmees Menu and CoD Xe", {
+  "Installed menus", "Shmees Menu", "Remove", "Remove", "OK",
+  "CoD Xe", "Remove", "Remove", "OK",
+})
+check("game folder clean again (no _codxe left)", not exists(MW2 .. "/_codxe") and read(MW2 .. "/patch_mp.ff") == "ORIGINAL PATCH")
+check("CoD Xe slot emptied", (read(ROOT .. "/Usb0/launch.ini") or ""):find("plugin3 = \r\n", 1, true))
+
+run("Download CodJumper for MW2", { "Download menus", "Modern Warfare 2", "CodJumper", "Download", "Later" })
+local cj = read(SCRIPT .. "/Menus/MW2/CodJumper/menu.ini") or ""
+check("CodJumper package saved with its licence", cj:find("author      = michaeloliverx (CoD Xe)", 1, true) and
+  exists(SCRIPT .. "/Menus/MW2/CodJumper/LICENSE.txt") and
+  (read(SCRIPT .. "/Menus/MW2/CodJumper/files/_codxe/codxe.json") or ""):find('"codjumper"', 1, true), cj)
+
+A.web = {}
+run("Library offline", { "Download menus", "Try the library again", "OK" })
+check("offline explained", seen("Library offline") and seen("Menus\\_Inbox"))
+
 print(string.format("\n%d passed, %d failed", pass, fail))
 os.exit(fail == 0 and 0 or 1)
